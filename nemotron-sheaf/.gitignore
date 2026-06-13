@@ -1,0 +1,73 @@
+# =============================================================================
+# .gitignore — Nemotron Sheaf
+# =============================================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Phase outputs (generated artifacts)
+phase0_results/
+phase1_data/
+phase2_checkpoints/
+phase4_results/
+submission/
+
+# Model weights & checkpoints (large binaries)
+*.safetensors
+*.bin
+*.pt
+*.pth
+!requirements.txt
+
+# HuggingFace cache (if stored in project)
+.cache/
+huggingface/
+
+# Environment & secrets
+.env
+*.env
+HF_TOKEN
+hf_token
+
+# Kaggle
+kaggle.json
+.kaggle/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# OS files
+Thumbs.db
+Desktop.ini
