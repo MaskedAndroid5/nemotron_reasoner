@@ -7,6 +7,11 @@
 #   bash run_all.sh --full                 # Run full pipeline (data + train + package)
 #   bash run_all.sh --train-only           # Run only training
 #   bash run_all.sh --submit               # Package and validate submission
+#
+# Override defaults via environment variables:
+#   MODEL_ID="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"
+#   GENERATE_NUM_EXAMPLES=500
+#   GENERATE_CONCURRENCY=4
 # =============================================================================
 
 set -euo pipefail
@@ -15,18 +20,19 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-phase0_results}"
 MODEL_ID="${MODEL_ID:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
 HF_TOKEN="${HF_TOKEN:-}"
-MODE="${1:-verify}"  # verify | full | train-only | submit
+MODE="${1:-verify}"
+
+# Generation defaults (configurable via env)
+GENERATE_NUM_EXAMPLES="${GENERATE_NUM_EXAMPLES:-200}"
+GENERATE_CONCURRENCY="${GENERATE_CONCURRENCY:-2}"
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 log() {
     echo -e "${BLUE}[$(date +'%H:%M:%S')]${NC} $1"
 }
@@ -67,11 +73,10 @@ run_phase0() {
     
     mkdir -p "$OUTPUT_DIR"
     
-    # Gate 1 — Module Coverage (structural‑only, fast)
     log "Gate 1: Module Coverage"
-    if python "$SCRIPT_DIR/phase0/01_module_coverage.py" \
+    if python "$SCRIPT_DIR/01_module_coverage.py" \
         --model "$MODEL_ID" \
-        --classifier "$SCRIPT_DIR/phase0/architecture_classifier.py" \
+        --classifier "$SCRIPT_DIR/architecture_classifier.py" \
         --output-dir "$OUTPUT_DIR" \
         --structural-only; then
         pass "Gate 1 passed"
@@ -80,9 +85,8 @@ run_phase0() {
         exit 1
     fi
     
-    # Gate 2 — Hidden State Extraction
     log "Gate 2: Hidden State Extraction"
-    if python "$SCRIPT_DIR/phase0/02_hidden_state_extraction.py" \
+    if python "$SCRIPT_DIR/02_hidden_state_extraction.py" \
         --model "$MODEL_ID" \
         --output-dir "$OUTPUT_DIR"; then
         pass "Gate 2 passed"
@@ -91,9 +95,8 @@ run_phase0() {
         exit 1
     fi
     
-    # Gate 3 — vLLM / PEFT Equivalence
     log "Gate 3: vLLM Equivalence"
-    if python "$SCRIPT_DIR/phase0/03_vllm_equivalence.py" \
+    if python "$SCRIPT_DIR/03_vllm_equivalence.py" \
         --model "$MODEL_ID" \
         --output-dir "$OUTPUT_DIR"; then
         pass "Gate 3 passed"
@@ -102,9 +105,8 @@ run_phase0() {
         exit 1
     fi
     
-    # Gate 4 — Boxed‑Answer Extraction (no GPU needed)
     log "Gate 4: Boxed‑Answer Extraction"
-    if python "$SCRIPT_DIR/phase0/04_boxed_answer_extraction.py" \
+    if python "$SCRIPT_DIR/04_boxed_answer_extraction.py" \
         --output-dir "$OUTPUT_DIR"; then
         pass "Gate 4 passed"
     else
@@ -112,9 +114,8 @@ run_phase0() {
         exit 1
     fi
     
-    # Gate 5 — Integration Smoke Test
     log "Gate 5: Integration Smoke Test"
-    if python "$SCRIPT_DIR/phase0/05_integration_smoke_test.py" \
+    if python "$SCRIPT_DIR/05_integration_smoke_test.py" \
         --model "$MODEL_ID" \
         --output-dir "$OUTPUT_DIR" \
         --skip-stress; then
@@ -151,21 +152,21 @@ run_phase1() {
     for agent in "${AGENTS[@]}"; do
         log "Generating data for: $agent"
         
-        python "$SCRIPT_DIR/phase1/generate_synthetic_data_v3.py" \
+        python "$SCRIPT_DIR/../phase1/generate_synthetic_data_v3.py" \
             --agent "$agent" \
-            --num-examples 200 \
+            --num-examples "$GENERATE_NUM_EXAMPLES" \
             --output-dir "phase1_data/$agent" \
             --model "$MODEL_ID" \
-            --concurrency 2 || warn "Data generation for $agent had failures"
+            --concurrency "$GENERATE_CONCURRENCY" || warn "Data generation for $agent had failures"
         
         log "Filtering data for: $agent"
-        python "$SCRIPT_DIR/phase1/quality_filter.py" \
+        python "$SCRIPT_DIR/../phase1/quality_filter.py" \
             --input-dir "phase1_data/$agent" \
             --output-dir "phase1_data/$agent/filtered" \
             --agent "$agent" || warn "Quality filter for $agent had failures"
         
         log "Formatting data for: $agent"
-        python "$SCRIPT_DIR/phase1/format_dataset.py" \
+        python "$SCRIPT_DIR/../phase1/format_dataset.py" \
             --input-dir "phase1_data/$agent/filtered" \
             --output-dir "phase1_data/formatted/$agent" \
             --model "$MODEL_ID" || warn "Formatting for $agent had failures"
@@ -182,7 +183,7 @@ run_phase2() {
     log "Phase 2 — Training"
     log "============================================"
     
-    python "$SCRIPT_DIR/phase2/train_lora.py" \
+    python "$SCRIPT_DIR/../phase2/train_lora.py" \
         --config "$OUTPUT_DIR/lora_config_safe.yaml" \
         --data-dir "phase1_data/formatted" \
         --output-dir "phase2_checkpoints/run_001" \
@@ -212,12 +213,12 @@ run_phase4() {
     fi
     
     log "Validating adapter..."
-    python "$SCRIPT_DIR/phase4/validate_submission.py" \
+    python "$SCRIPT_DIR/../phase4/validate_submission.py" \
         --submission "$ADAPTER_DIR" \
         --output-dir "phase4_results" || warn "Validation had warnings (may still be valid)"
     
     log "Packaging submission..."
-    python "$SCRIPT_DIR/phase4/package_submission.py" \
+    python "$SCRIPT_DIR/../phase4/package_submission.py" \
         --adapter "$ADAPTER_DIR" \
         --output "submission/submission.zip"
     
@@ -269,6 +270,12 @@ main() {
             echo "  full        Run full pipeline (verify + data + train + package)"
             echo "  train-only  Run verification + data + training"
             echo "  submit      Package and validate existing adapter"
+            echo ""
+            echo "Environment variables:"
+            echo "  MODEL_ID                Base model (default: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)"
+            echo "  GENERATE_NUM_EXAMPLES   Examples per agent (default: 200)"
+            echo "  GENERATE_CONCURRENCY    Concurrent generations (default: 2)"
+            echo "  HF_TOKEN                HuggingFace token for gated model access"
             exit 1
             ;;
     esac
