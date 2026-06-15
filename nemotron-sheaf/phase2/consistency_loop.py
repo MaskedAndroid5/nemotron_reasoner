@@ -7,21 +7,21 @@ agent router, cross‑checks their structured traces via the sheaf‑consistency
 loss, and synthesises the most consistent final answer.
 
 Critical fixes for Nemotron‑3‑Nano‑30B‑A3B‑BF16 compatibility:
-  1. **Hidden state extraction** – vLLM does not expose hidden states.
+  1. Hidden state extraction – vLLM does not expose hidden states.
      We use a separate HuggingFace `AutoModelForCausalLM` with the
      trained LoRA adapter (via PEFT) to extract token‑level hidden
      states on the generated traces.  This adds a small latency overhead
      but is necessary for sheaf consistency scoring.
-  2. **Prompt template** – Uses `apply_chat_template` with the official
+  2. Prompt template – Uses `apply_chat_template` with the official
      Nemotron chat format (including `<think>` tags for reasoning).
-  3. **LoRA validation** – Before scoring, verifies that the adapter
+  3. LoRA validation – Before scoring, verifies that the adapter
      contains sheaf projection weights.  If not, raises a clear error.
-  4. **Tag extraction** – Uses token positions (via the tokenizer)
+  4. Tag extraction – Uses token positions (via the tokenizer)
      instead of character offsets to match sheaf loss expectations.
-  5. **Memory management** – The HuggingFace model can be offloaded to
+  5. Memory management – The HuggingFace model can be offloaded to
      CPU (`--hf-device cpu`) to avoid OOM when running alongside vLLM.
      Using the FP8 model variant is recommended for single‑GPU setups.
-  6. **Fallback scoring** – If hidden state extraction fails (e.g. OOM
+  6. Fallback scoring – If hidden state extraction fails (e.g. OOM
      or adapter format mismatch), falls back to heuristic scoring.
 
 Requirements
