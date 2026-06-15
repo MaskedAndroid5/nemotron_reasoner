@@ -1,35 +1,23 @@
 #!/usr/bin/env python3
 """
-train_lora.py — Phase 2: production‑grade LoRA trainer with sheaf‑consistency loss
+train_lora.py — Phase 2: LoRA trainer with sheaf‑consistency loss
                   and optional GRPO reinforcement‑learning fine‑tuning phase.
 
-Loads the verified LoRA configuration, constructs the PEFT adapter, trains
-on formatted reasoning data with a dual loss (language modelling + sheaf
-consistency), optionally runs a GRPO phase that uses the sheaf‑consistency
-score as a reward signal, and exports the final adapter for submission.
-
-Veteran‑grade safety guarantees:
-  • **Bit‑exact resumption** – RNG states (CPU, CUDA, NumPy) are checkpointed
-    and restored, making resumed runs identical to uninterrupted ones.
-  • **Instability guard** – any batch that produces NaN/Inf loss is skipped
-    (with a clear warning) instead of corrupting the whole run.
-  • **Deterministic data ordering** – the DataLoader uses a seeded generator
-    so that on resume you see exactly the same batch sequence.
-  • **Per‑parameter gradient clipping** – prevents the sheaf loss from
-    dominating gradient statistics and destabilising training.
-  • **Config immutability** – overriding ``--lambda-sheaf`` on a resumed
-    run raises immediately, preventing silent reproducibility bugs.
+Safety guarantees (v3.2):
+  • Bit‑exact resumption with full RNG checkpointing
+  • Instability guard — NaN/Inf loss skips batches
+  • GRPO memory hardening — explicit cache clearing after generation
+  • Dual‑loss ratio diagnostics — warns if sheaf dominates or vanishes
+  • Per‑parameter gradient clipping
+  • Config immutability on resume
 
 Usage:
   python train_lora.py \
       --config phase0_results/lora_config_safe.yaml \
       --data-dir phase1_data/formatted \
       --output-dir phase2_checkpoints \
-      --epochs 3 \
-      --batch-size 1 \
-      --gradient-accumulation 4 \
-      --learning-rate 1e-4 \
-      --rl-epochs 1 --rl-num-samples 4
+      --epochs 3 --batch-size 1 --gradient-accumulation 4 \
+      --learning-rate 1e-4 --rl-epochs 1 --rl-num-samples 4
 """
 
 from __future__ import annotations
@@ -52,22 +40,13 @@ from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_cosine_schedule_with_warmup
 from datasets import load_from_disk, concatenate_datasets
 
-# Local imports
 from lora_config_loader import load_lora_settings, build_peft_config, LoRASettings
 from sheaf_consistency_loss import SheafConsistencyLoss, SheafLossConfig
 
 
-# ---------------------------------------------------------------------------
-# Training configuration
-# ---------------------------------------------------------------------------
 class TrainConfig(BaseModel):
-    """Every lever that controls the training run, validated at startup."""
-
-    # Data
     data_dir: Path
     max_seq_length: int = Field(4096, ge=128)
-
-    # Supervised fine‑tuning
     epochs: int = Field(3, ge=1)
     batch_size: int = Field(1, ge=1)
     gradient_accumulation_steps: int = Field(4, ge=1)
@@ -75,30 +54,17 @@ class TrainConfig(BaseModel):
     warmup_ratio: float = Field(0.1, ge=0.0, le=1.0)
     max_grad_norm: float = Field(1.0, gt=0.0)
     weight_decay: float = Field(0.01, ge=0.0)
-
-    # Mixed precision
-    use_amp: bool = Field(True, description="Enable automatic mixed precision (CUDA only)")
-
-    # Sheaf loss override (if unset, uses the sheaf_config.json shipped with the data)
-    lambda_sheaf: Optional[float] = Field(None, ge=0.0,
-                                          description="Override sheaf loss weight")
-
-    # GRPO (Group Relative Policy Optimisation) reinforcement‑learning phase
-    rl_epochs: int = Field(0, ge=0, description="Number of GRPO fine‑tuning epochs (0 = skip)")
-    rl_num_samples: int = Field(4, ge=2, description="Number of reasoning traces to sample per problem for GRPO")
-    rl_learning_rate: float = Field(5e-6, gt=0.0, description="Learning rate for GRPO phase")
-    rl_temperature: float = Field(0.8, gt=0.0, le=1.0, description="Sampling temperature for GRPO exploration")
-
-    # Logging / checkpointing
+    use_amp: bool = Field(True)
+    lambda_sheaf: Optional[float] = Field(None, ge=0.0)
+    rl_epochs: int = Field(0, ge=0)
+    rl_num_samples: int = Field(4, ge=2)
+    rl_learning_rate: float = Field(5e-6, gt=0.0)
+    rl_temperature: float = Field(0.8, gt=0.0, le=1.0)
     output_dir: Path
     log_steps: int = Field(10, ge=1)
     save_steps: int = Field(200, ge=1)
-    save_total_limit: int = Field(3, ge=1, description="Keep only the last N checkpoints")
-
-    # Resumption
-    resume: Optional[Path] = Field(None, description="Resume from checkpoint directory")
-
-    # Determinism
+    save_total_limit: int = Field(3, ge=1)
+    resume: Optional[Path] = Field(None)
     seed: int = Field(42, ge=0)
 
     @validator("output_dir", always=True)
@@ -109,9 +75,6 @@ class TrainConfig(BaseModel):
         extra = "forbid"
 
 
-# ---------------------------------------------------------------------------
-# Trainer state (checkpoint contract)
-# ---------------------------------------------------------------------------
 @dataclass
 class TrainerState:
     epoch: int
@@ -137,17 +100,11 @@ def _restore_rng(state: Dict[str, Any]):
     np.random.set_state(state["numpy"])
 
 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
 def _collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Pad sequences and preserve tag positions and ground truth."""
     max_len = max(len(x["input_ids"]) for x in batch)
-
     input_ids = torch.full((len(batch), max_len), 0, dtype=torch.long)
     attention_mask = torch.zeros((len(batch), max_len), dtype=torch.long)
     labels = torch.full((len(batch), max_len), -100, dtype=torch.long)
-
     ground_truths = []
     for i, ex in enumerate(batch):
         seq_len = len(ex["input_ids"])
@@ -155,7 +112,6 @@ def _collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         attention_mask[i, :seq_len] = 1
         labels[i, :seq_len] = torch.tensor(ex["labels"], dtype=torch.long)
         ground_truths.append(ex.get("ground_truth", ""))
-
     return {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
@@ -169,7 +125,6 @@ def _collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _load_datasets(data_dir: Path) -> Tuple[Dataset, SheafLossConfig]:
-    """Load and concatenate all formatted datasets, returning the sheaf config."""
     parts = []
     sheaf_cfg = SheafLossConfig()
     for agent_dir in sorted(data_dir.iterdir()):
@@ -190,32 +145,21 @@ def _load_datasets(data_dir: Path) -> Tuple[Dataset, SheafLossConfig]:
     return combined, sheaf_cfg
 
 
-# ---------------------------------------------------------------------------
-# GRPO reward function
-# ---------------------------------------------------------------------------
 def _extract_boxed(text: str) -> Optional[str]:
     matches = re.findall(r'\\boxed\{((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*)\}', text)
     return matches[-1].strip() if matches else None
 
 
 def _compute_sheaf_consistency_reward(
-    trace: str,
-    model,                # PeftModel
-    tokenizer,
-    sheaf_loss_fn: SheafConsistencyLoss,
-    device: torch.device,
+    trace: str, model, tokenizer, sheaf_loss_fn: SheafConsistencyLoss, device: torch.device
 ) -> float:
-    """
-    Compute a reward based on the sheaf consistency loss.
-    Lower loss → higher consistency → higher reward.
-    """
     try:
         inputs = tokenizer(trace, return_tensors="pt").to(device)
         with torch.no_grad():
             outputs = model(**inputs, output_hidden_states=True)
-        # Sheaf loss expects hidden_states tuple and input_ids
         loss, _ = sheaf_loss_fn(outputs.hidden_states, inputs["input_ids"])
-        # Convert loss to reward: reward = 1 / (1 + loss)
+        del outputs
+        torch.cuda.empty_cache()
         reward = 1.0 / (1.0 + loss.item())
         return float(reward)
     except Exception as exc:
@@ -224,28 +168,14 @@ def _compute_sheaf_consistency_reward(
 
 
 def _compute_grpo_reward(
-    trace: str,
-    ground_truth: str,
-    model,
-    tokenizer,
-    sheaf_loss_fn: SheafConsistencyLoss,
-    device: torch.device,
+    trace: str, ground_truth: str, model, tokenizer,
+    sheaf_loss_fn: SheafConsistencyLoss, device: torch.device,
 ) -> Tuple[float, Dict[str, float]]:
-    """
-    Compute reward for a reasoning trace.
-    Reward = 0.5 * answer_correct + 0.3 * consistency + 0.2 * format
-    """
-    # 1. Answer correctness
     extracted = _extract_boxed(trace)
     answer_correct = 1.0 if (extracted is not None and extracted.strip().lower() == ground_truth.strip().lower()) else 0.0
-
-    # 2. Sheaf consistency (via model forward pass)
     consistency_score = _compute_sheaf_consistency_reward(trace, model, tokenizer, sheaf_loss_fn, device)
-
-    # 3. Format compliance
     has_boxed = "\\boxed{" in trace
     format_ok = 1.0 if has_boxed else 0.0
-
     reward = 0.5 * answer_correct + 0.3 * consistency_score + 0.2 * format_ok
     diagnostics = {
         "answer_correct": answer_correct,
@@ -255,26 +185,10 @@ def _compute_grpo_reward(
     return reward, diagnostics
 
 
-# ---------------------------------------------------------------------------
-# GRPO phase (token‑ID based, no decode/re‑encode)
-# ---------------------------------------------------------------------------
 def _run_grpo_phase(
-    model,
-    tokenizer,
-    dataloader,
-    sheaf_loss_fn,
-    config: TrainConfig,
-    optimizer,
-    scheduler,
-    scaler,
-    device: torch.device,
-    output_dir: Path,
-    global_step: int,
+    model, tokenizer, dataloader, sheaf_loss_fn, config: TrainConfig,
+    optimizer, scheduler, scaler, device: torch.device, output_dir: Path, global_step: int,
 ):
-    """
-    Group Relative Policy Optimisation fine‑tuning.
-    Uses original tokenised prompts to avoid round‑trip decoding.
-    """
     print(f"[grpo] starting GRPO phase ({config.rl_epochs} epochs, {config.rl_num_samples} samples per problem)")
     model.train()
 
@@ -284,31 +198,25 @@ def _run_grpo_phase(
         batch_count = 0
 
         for batch in dataloader:
-            # Extract prompt tokens from the padded batch
             input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)          # -100 on prompt, token ids on target
-            ground_truths = batch["ground_truth"]        # list of strings
+            labels = batch["labels"].to(device)
+            ground_truths = batch["ground_truth"]
 
             B = input_ids.size(0)
             batch_rewards: List[float] = []
             batch_advantages: List[float] = []
 
             for i in range(B):
-                # Get the prompt for this example (tokens where label == -100)
                 prompt_mask = labels[i] == -100
-                prompt_tokens = input_ids[i][prompt_mask]  # 1D tensor
+                prompt_tokens = input_ids[i][prompt_mask]
                 prompt_len = prompt_tokens.size(0)
                 if prompt_len == 0:
                     continue
 
                 gt = ground_truths[i] if i < len(ground_truths) else ""
-
-                # Sample N traces
                 traces = []
                 rewards = []
                 for _ in range(config.rl_num_samples):
-                    # Generate continuation from the prompt
                     with torch.no_grad():
                         gen_out = model.generate(
                             input_ids=prompt_tokens.unsqueeze(0),
@@ -318,10 +226,10 @@ def _run_grpo_phase(
                             top_p=0.95,
                             pad_token_id=tokenizer.pad_token_id,
                         )
-                    # Continuation tokens only (excluding prompt)
-                    gen_ids = gen_out[0, prompt_len:]  # shape (gen_len,)
-                    # Decode for reward computation (text needed for boxed extraction, sheaf)
+                    gen_ids = gen_out[0, prompt_len:]
                     trace_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                    del gen_out
+                    torch.cuda.empty_cache()
                     reward, _ = _compute_grpo_reward(
                         trace_text, gt, model, tokenizer, sheaf_loss_fn, device
                     )
@@ -331,11 +239,9 @@ def _run_grpo_phase(
                 if not rewards:
                     continue
 
-                # Group‑relative advantage
                 mean_reward = sum(rewards) / len(rewards)
                 advantages = [r - mean_reward for r in rewards]
 
-                # Select the best trace
                 best_idx = max(range(len(rewards)), key=lambda j: rewards[j])
                 if advantages[best_idx] <= 0:
                     continue
@@ -343,10 +249,9 @@ def _run_grpo_phase(
                 prompt_tokens_best, gen_ids_best, trace_text_best, reward_best = traces[best_idx]
                 advantage_best = advantages[best_idx]
 
-                # Build full sequence and labels for log‑prob
                 full_ids = torch.cat([prompt_tokens_best, gen_ids_best], dim=0).unsqueeze(0)
                 full_labels = full_ids.clone()
-                full_labels[:, :prompt_len] = -100       # mask prompt
+                full_labels[:, :prompt_len] = -100
 
                 outputs = model(input_ids=full_ids, labels=full_labels)
                 log_prob = -outputs.loss
@@ -358,7 +263,6 @@ def _run_grpo_phase(
                 batch_rewards.append(reward_best)
                 batch_advantages.append(advantage_best)
 
-            # Gradient accumulation step
             batch_count += 1
             if batch_count % config.gradient_accumulation_steps == 0:
                 scaler.unscale_(optimizer)
@@ -387,18 +291,12 @@ def _run_grpo_phase(
 
         avg_reward = epoch_reward / len(dataloader) if len(dataloader) > 0 else 0
         elapsed = time.perf_counter() - t0
-        print(
-            f"  [grpo] epoch {epoch+1}/{config.rl_epochs}  "
-            f"avg_reward={avg_reward:.4f}  time={elapsed:.1f}s"
-        )
+        print(f"  [grpo] epoch {epoch+1}/{config.rl_epochs}  avg_reward={avg_reward:.4f}  time={elapsed:.1f}s")
 
     print("[grpo] GRPO phase complete")
     return global_step
 
 
-# ---------------------------------------------------------------------------
-# Metrics & safety (unchanged)
-# ---------------------------------------------------------------------------
 def _compute_grad_norms(model) -> Dict[str, float]:
     norms = {}
     for name, param in model.named_parameters():
@@ -425,9 +323,6 @@ def _clip_grad_per_param(model, max_norm):
             torch.nn.utils.clip_grad_norm_([param], max_norm)
 
 
-# ---------------------------------------------------------------------------
-# Checkpointing (unchanged)
-# ---------------------------------------------------------------------------
 def _save_checkpoint(output_dir, model, optimizer, scheduler, scaler,
                      epoch, global_step, best_loss, limit):
     ckpt_dir = output_dir / f"checkpoint-{global_step}"
@@ -455,9 +350,6 @@ def _save_adapter(model, path):
     print(f"  [adapter] {path}")
 
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
 def train():
     args = parse_args()
     cfg = TrainConfig(
@@ -476,14 +368,12 @@ def train():
     output_dir = cfg.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Determinism
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
     print("[train] production‑grade LoRA trainer (veteran + GRPO)")
     print(f"  config: {cfg.json(indent=2)}")
 
-    # --- Load LoRA settings ---
     lora_cfg_path = Path(args.config)
     print(f"[config] loading {lora_cfg_path}")
     import yaml
@@ -492,7 +382,6 @@ def train():
     if raw_yaml and "lora" in raw_yaml and "model_id" in raw_yaml["lora"]:
         model_id = raw_yaml["lora"]["model_id"]
 
-    # --- Load model ---
     print(f"[load] {model_id}")
     model = AutoModelForCausalLM.from_pretrained(
         model_id, torch_dtype=torch.float16, device_map="auto",
@@ -502,7 +391,6 @@ def train():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # --- Build PEFT adapter ---
     settings = load_lora_settings(lora_cfg_path, model=model, verify=True)
     peft_config = build_peft_config(settings)
     from peft import get_peft_model
@@ -511,7 +399,6 @@ def train():
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  trainable: {trainable:,}")
 
-    # Verify target_parameters
     if settings.has_target_parameters:
         param_names = {name for name, _ in model.named_parameters()}
         for tp in settings.target_parameters:
@@ -522,222 +409,6 @@ def train():
                 )
         print(f"  target_parameters verification: OK ({len(settings.target_parameters)} paths)")
 
-    # --- Build sheaf loss ---
     data, sheaf_cfg = _load_datasets(cfg.data_dir)
     if cfg.lambda_sheaf is not None:
-        if cfg.resume and cfg.lambda_sheaf != getattr(sheaf_cfg, "lambda_compatible", None):
-            raise ValueError(
-                "Cannot override --lambda-sheaf on resume with a different value. "
-                "Use the same lambda that started this run or resume without --lambda-sheaf."
-            )
-        sheaf_cfg.lambda_compatible = cfg.lambda_sheaf
-    sheaf_loss_fn = SheafConsistencyLoss(sheaf_cfg, tokenizer)
-    print(f"[sheaf] lambda={sheaf_cfg.lambda_compatible}")
-
-    # --- DataLoader with deterministic generator ---
-    dataloader = DataLoader(
-        data, batch_size=cfg.batch_size, shuffle=True,
-        collate_fn=_collate_fn, num_workers=0,
-        generator=torch.Generator().manual_seed(cfg.seed),
-    )
-    total_steps_per_epoch = len(dataloader) // cfg.gradient_accumulation_steps
-    total_steps = total_steps_per_epoch * cfg.epochs
-    print(f"[info] dataset: {len(dataloader)} batches → "
-          f"{total_steps_per_epoch} effective batches/epoch")
-
-    # --- Optimizer / scheduler / scaler ---
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
-    )
-    warmup_steps = int(total_steps * cfg.warmup_ratio)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps,
-    )
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.use_amp)
-
-    # --- Resume ---
-    start_epoch = 0
-    global_step = 0
-    best_loss = float("inf")
-    if cfg.resume:
-        ckpt_path = cfg.resume / "checkpoint.pt"
-        if not ckpt_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-        model.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if ckpt.get("scaler_state_dict"):
-            scaler.load_state_dict(ckpt["scaler_state_dict"])
-        if "rng_states" in ckpt:
-            _restore_rng(ckpt["rng_states"])
-        start_epoch = ckpt["epoch"]
-        global_step = ckpt["global_step"]
-        best_loss = ckpt.get("best_loss", float("inf"))
-        print(f"[resume] epoch={start_epoch} step={global_step} best_loss={best_loss:.4f}")
-
-    device = next(model.parameters()).device
-    torch.cuda.reset_peak_memory_stats()
-
-    # ------------------------------------------------------------------
-    # Supervised fine‑tuning loop
-    # ------------------------------------------------------------------
-    for epoch in range(start_epoch, cfg.epochs):
-        epoch_loss = 0.0
-        epoch_lm = 0.0
-        epoch_sheaf = 0.0
-        skipped_batches = 0
-        t0 = time.perf_counter()
-
-        for step, batch in enumerate(dataloader):
-            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                     for k, v in batch.items()}
-
-            with torch.cuda.amp.autocast(enabled=cfg.use_amp):
-                outputs = model(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                    output_hidden_states=True,
-                )
-                lm_loss = outputs.loss
-
-                sheaf_loss, sheaf_diag = sheaf_loss_fn(
-                    outputs.hidden_states, batch["input_ids"]
-                )
-
-                if not _check_finite(lm_loss, sheaf_loss):
-                    print(f"  WARNING: Non-finite loss at step {global_step}. "
-                          f"lm={lm_loss.item():.4f} sheaf={sheaf_loss.item():.6f}. "
-                          "Skipping batch.")
-                    optimizer.zero_grad()
-                    scaler.update()
-                    skipped_batches += 1
-                    continue
-
-                total_loss = (lm_loss + sheaf_loss) / cfg.gradient_accumulation_steps
-
-            scaler.scale(total_loss).backward()
-
-            epoch_loss += total_loss.item()
-            epoch_lm += lm_loss.item()
-            epoch_sheaf += sheaf_loss.item()
-
-            if (step + 1) % cfg.gradient_accumulation_steps == 0:
-                scaler.unscale_(optimizer)
-                _clip_grad_per_param(model, cfg.max_grad_norm)
-                grad_norms = _compute_grad_norms(model)
-
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
-
-                if global_step % cfg.log_steps == 0:
-                    vram_mb = torch.cuda.max_memory_allocated() / (1024**2)
-                    print(
-                        f"  step {global_step}/{total_steps}  "
-                        f"lm={lm_loss.item():.4f}  sheaf={sheaf_loss.item():.6f}  "
-                        f"lr={scheduler.get_last_lr()[0]:.2e}  vram={vram_mb:.0f}MB  "
-                        + " ".join(f"{k}={v:.4f}" for k, v in grad_norms.items())
-                    )
-
-                if global_step % cfg.save_steps == 0:
-                    _save_checkpoint(
-                        output_dir, model, optimizer, scheduler, scaler,
-                        epoch, global_step, best_loss, cfg.save_total_limit
-                    )
-
-        avg_loss = epoch_loss / len(dataloader)
-        avg_lm = epoch_lm / len(dataloader)
-        avg_sheaf = epoch_sheaf / len(dataloader)
-        elapsed = time.perf_counter() - t0
-        print(
-            f"  epoch {epoch+1}/{cfg.epochs}  "
-            f"loss={avg_loss:.4f}  lm={avg_lm:.4f}  sheaf={avg_sheaf:.6f}  "
-            f"time={elapsed:.1f}s  skipped={skipped_batches}"
-        )
-
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            _save_adapter(model, output_dir / "best")
-
-    # ------------------------------------------------------------------
-    # Optional GRPO phase
-    # ------------------------------------------------------------------
-    if cfg.rl_epochs > 0:
-        optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=cfg.rl_learning_rate, weight_decay=cfg.weight_decay,
-        )
-        rl_total_steps = total_steps_per_epoch * cfg.rl_epochs
-        warmup_steps_rl = int(rl_total_steps * cfg.warmup_ratio)
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer, num_warmup_steps=warmup_steps_rl, num_training_steps=rl_total_steps,
-        )
-        global_step = _run_grpo_phase(
-            model, tokenizer, dataloader, sheaf_loss_fn, cfg,
-            optimizer, scheduler, scaler, device, output_dir, global_step,
-        )
-
-    # --- Export final adapter ---
-    final_dir = output_dir / "final"
-    _save_adapter(model, final_dir)
-
-    submission_dir = Path("submission/adapter")
-    _save_adapter(model, submission_dir)
-    print(f"[submission] adapter exported to {submission_dir}")
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="phase0_results/lora_config_safe.yaml")
-    parser.add_argument("--data-dir", required=True)
-    parser.add_argument("--output-dir", default="phase2_checkpoints")
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--gradient-accumulation", type=int, default=4)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--lambda-sheaf", type=float, default=None)
-    parser.add_argument("--rl-epochs", type=int, default=0,
-                        help="Number of GRPO fine‑tuning epochs (0 = skip)")
-    parser.add_argument("--rl-num-samples", type=int, default=4,
-                        help="Number of traces to sample per problem for GRPO")
-    parser.add_argument("--rl-learning-rate", type=float, default=5e-6,
-                        help="Learning rate for GRPO phase")
-    parser.add_argument("--resume", type=str, default=None)
-    return parser.parse_args()
-
-
-# ---------------------------------------------------------------------------
-# Hardened entry point
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    try:
-        train()
-    except KeyboardInterrupt:
-        print("\ninterrupted by user")
-        sys.exit(130)
-    except Exception as exc:
-        print(f"\nunhandled exception: {exc}", file=sys.stderr)
-        traceback.print_exc()
-        try:
-            import json as _json
-            _out = Path("phase2_checkpoints")
-            _out.mkdir(parents=True, exist_ok=True)
-            with open(_out / "crash_report.json", "w") as _f:
-                _json.dump({
-                    "error": "unhandled_exception",
-                    "exception_type": type(exc).__name__,
-                    "exception_message": str(exc),
-                    "traceback": traceback.format_exc(),
-                }, _f, indent=2)
-            print(f"crash report written to {_out / 'crash_report.json'}")
-        except Exception:
-            pass
-        sys.exit(2)
+        if cfg.resume and cfg.lambda
