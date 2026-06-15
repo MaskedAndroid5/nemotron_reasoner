@@ -7,7 +7,7 @@ taxonomy and returns the best agent(s) to solve it.
 
 Strategy
 --------
-  • **Few‑shot classification** – Nemotron itself is prompted with the
+  • Few‑shot classification – Nemotron itself is prompted with the
     list of agents and their role descriptions, then asked to classify
     the problem.  This is the only supported strategy because Nemotron‑3‑Nano
     is a generative model; it cannot be used as an embedding encoder.
