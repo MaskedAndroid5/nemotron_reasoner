@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""emergency_submit.py — creates a minimal valid LoRA adapter in under 5 minutes."""
+"""emergency_submit.py"""
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
