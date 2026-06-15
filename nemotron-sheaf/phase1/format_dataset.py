@@ -3,7 +3,7 @@
 format_dataset.py — Phase 1: dataset builder
 
 Converts filtered reasoning traces (JSONL) into tokenised instruction‑style
-datasets augmented with sheaf‑tag position metadata.
+datasets augmented with sheaf‑tag position metadata and ground‑truth answers.
 
 Every example in the output dataset contains:
   • input_ids, attention_mask, labels            – standard LM tensors
@@ -11,6 +11,7 @@ Every example in the output dataset contains:
   • overlap_positions                            – token indices of <overlap> tags
   • compatible_positions                         – token indices of <compatible> tags
   • incompatible_positions                       – token indices of <incompatible> tags
+  • ground_truth                                 – original answer string (for GRPO reward)
 
 The positions are consumed directly by `SheafConsistencyLoss` during
 training, avoiding redundant re‑parsing of raw text.
@@ -206,7 +207,7 @@ def format_dataset(
     config: FormatConfig,
 ) -> FormatReport:
     """Convert filtered JSONL examples into a HuggingFace Dataset."""
-    # Load tokenizer with error handling (AUDIT FIX: was unhandled)
+    # Load tokenizer with error handling
     try:
         tokenizer = AutoTokenizer.from_pretrained(
             config.model_id, trust_remote_code=True
@@ -237,7 +238,6 @@ def format_dataset(
     report.total = len(examples)
 
     # Pre‑filter: estimate token count to skip obviously long examples
-    # NOTE: Using a 1.3x safety margin; fine-tune if dropping too many valid examples
     token_lengths = []
     kept_examples = []
     drop_reasons: Counter = Counter()
@@ -250,22 +250,23 @@ def format_dataset(
             continue
 
         # Rough token estimate: word count * 1.33 heuristic
-        # This is conservative to avoid OOM during tokenization;
-        # actual token count will be verified during tokenization step
         rough_len = int(len(assistant.split()) * 1.33 + len(system.split()) * 1.33 + len(user.split()) * 1.33)
         if rough_len > config.max_seq_length * 1.3:
             drop_reasons["estimated_overflow"] += 1
             continue
 
-        kept_examples.append((system, user, assistant))
+        # Keep the ground_truth for GRPO reward
+        kept_examples.append({
+            "system": system,
+            "user": user,
+            "assistant": assistant,
+            "ground_truth": ex.get("ground_truth", ""),
+        })
 
     # Tokenise with parallel map
-    ds = Dataset.from_list(
-        [{"system": s, "user": u, "assistant": a} for s, u, a in kept_examples]
-    )
+    ds = Dataset.from_list(kept_examples)
 
     def tokenise_fn(batch):
-        # AUDIT FIX: Added defaultdict to imports at top
         results = defaultdict(list)
         for i in range(len(batch["system"])):
             out = _tokenise_and_validate_masking(
@@ -281,10 +282,13 @@ def format_dataset(
                 # Add dummy entries for column alignment
                 for key in ["input_ids", "attention_mask", "labels",
                             "claim_positions", "overlap_positions",
-                            "compatible_positions", "incompatible_positions"]:
+                            "compatible_positions", "incompatible_positions",
+                            "ground_truth"]:
                     results[key].append([])
             else:
                 results["_drop"].append(False)
+                # Preserve the original ground_truth for GRPO reward
+                out["ground_truth"] = batch["ground_truth"][i]
                 for key, val in out.items():
                     results[key].append(val)
         return results
@@ -294,7 +298,7 @@ def format_dataset(
         tokenise_fn,
         batched=True,
         batch_size=32,
-        remove_columns=["system", "user", "assistant"],
+        remove_columns=["system", "user", "assistant", "ground_truth"],
         num_proc=config.num_proc,
         desc="tokenising",
     )
@@ -304,7 +308,6 @@ def format_dataset(
     ds = ds.remove_columns("_drop")
 
     # Cast to fixed schema with Sequence types for variable-length lists
-    # AUDIT FIX: Moved Features, Sequence, Value imports to top-level (line 47)
     features = Features({
         "input_ids": Sequence(Value("int64")),
         "attention_mask": Sequence(Value("int64")),
@@ -313,6 +316,7 @@ def format_dataset(
         "overlap_positions": Sequence(Value("int64")),
         "compatible_positions": Sequence(Value("int64")),
         "incompatible_positions": Sequence(Value("int64")),
+        "ground_truth": Value("string"),
     })
     ds = ds.cast(features)
 
