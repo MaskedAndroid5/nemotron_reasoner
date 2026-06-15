@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-format_dataset.py — Phase 1: veteran‑grade dataset builder
+format_dataset.py — Phase 1: dataset builder
 
 Converts filtered reasoning traces (JSONL) into tokenised instruction‑style
 datasets augmented with sheaf‑tag position metadata.
@@ -39,14 +39,14 @@ import json
 import sys
 import textwrap
 import traceback
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-from datasets import Dataset, Sequence
+from datasets import Dataset, Features, Sequence, Value
 from pydantic import BaseModel, Field, validator
 from transformers import AutoTokenizer
 
@@ -206,9 +206,17 @@ def format_dataset(
     config: FormatConfig,
 ) -> FormatReport:
     """Convert filtered JSONL examples into a HuggingFace Dataset."""
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.model_id, trust_remote_code=True
-    )
+    # Load tokenizer with error handling (AUDIT FIX: was unhandled)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            config.model_id, trust_remote_code=True
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to load tokenizer for model '{config.model_id}': {exc}. "
+            f"Ensure the model ID is correct and HuggingFace Hub is accessible."
+        ) from exc
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -229,6 +237,7 @@ def format_dataset(
     report.total = len(examples)
 
     # Pre‑filter: estimate token count to skip obviously long examples
+    # NOTE: Using a 1.3x safety margin; fine-tune if dropping too many valid examples
     token_lengths = []
     kept_examples = []
     drop_reasons: Counter = Counter()
@@ -241,6 +250,8 @@ def format_dataset(
             continue
 
         # Rough token estimate: word count * 1.33 heuristic
+        # This is conservative to avoid OOM during tokenization;
+        # actual token count will be verified during tokenization step
         rough_len = int(len(assistant.split()) * 1.33 + len(system.split()) * 1.33 + len(user.split()) * 1.33)
         if rough_len > config.max_seq_length * 1.3:
             drop_reasons["estimated_overflow"] += 1
@@ -254,6 +265,7 @@ def format_dataset(
     )
 
     def tokenise_fn(batch):
+        # AUDIT FIX: Added defaultdict to imports at top
         results = defaultdict(list)
         for i in range(len(batch["system"])):
             out = _tokenise_and_validate_masking(
@@ -292,7 +304,7 @@ def format_dataset(
     ds = ds.remove_columns("_drop")
 
     # Cast to fixed schema with Sequence types for variable-length lists
-    from datasets import Features, Sequence, Value
+    # AUDIT FIX: Moved Features, Sequence, Value imports to top-level (line 47)
     features = Features({
         "input_ids": Sequence(Value("int64")),
         "attention_mask": Sequence(Value("int64")),
